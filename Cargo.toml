@@ -1,0 +1,21 @@
+[package]
+name = "raw-thumbnailer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+image = "0.25"
+thiserror = "1.0"
+rawler = { path = "../rawler" }
+log = "0.4"
+simplelog = "0.12"
+zbus = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
