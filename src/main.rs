@@ -4,9 +4,9 @@ use log::{error, info};
 use rawler::analyze::extract_preview_pixels;
 use rawler::decoders::RawDecodeParams;
 use rawler::imgop::develop::RawDevelop;
-use simplelog::{Config, LevelFilter, WriteLogger};
+use simplelog::{Config, LevelFilter, SimpleLogger};
 use std::env;
-use std::fs::OpenOptions;
+
 use std::path::Path;
 use zbus::{dbus_interface, ConnectionBuilder};
 
@@ -24,7 +24,7 @@ impl Thumbnailer {
         let input_path = Path::new(path_str);
         let output_path = Path::new(output_path);
 
-        match generate_thumbnail(input_path) {
+        match generate_thumbnail(input_path, 256) {
             Ok(thumbnail) => {
                 info!("Saving thumbnail to {:?}...", output_path);
                 if let Err(e) = thumbnail.save(output_path) {
@@ -43,16 +43,10 @@ impl Thumbnailer {
 }
 
 #[tokio::main(flavor = "current_thread")]
+
 async fn main() -> Result<()> {
-    if let Ok(log_file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/raw-thumbnailer.log")
-    {
-        // The service might fail to initialize if another instance is running,
-        // but we don't have a logger to report it to. We'll just ignore it.
-        let _ = WriteLogger::init(LevelFilter::Info, Config::default(), log_file);
-    }
+    // Initialize logging to stderr (compatible with bwrap sandboxes and systemd journal)
+    let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
 
     let args: Vec<String> = env::args().collect();
     if args.contains(&"--dbus".to_string()) {
@@ -66,17 +60,37 @@ async fn main() -> Result<()> {
         // Keep the service running
         std::future::pending::<()>().await;
     } else {
-        // Original command-line functionality for testing
-        if args.len() != 3 {
-            error!("Usage: {} <input.raw> <output.png>", args[0]);
+        // Parse arguments manually to handle -s flag
+        // Expected usage: raw-thumbnailer [-s size] <input> <output>
+        let mut input_path_str = String::new();
+        let mut output_path_str = String::new();
+        let mut size = 512; // Default size
+
+        let mut iter = args.iter().skip(1);
+        while let Some(arg) = iter.next() {
+            if arg == "-s" {
+                if let Some(s) = iter.next() {
+                    if let Ok(parsed_size) = s.parse::<u32>() {
+                        size = parsed_size;
+                    }
+                }
+            } else if input_path_str.is_empty() {
+                input_path_str = arg.clone();
+            } else if output_path_str.is_empty() {
+                output_path_str = arg.clone();
+            }
+        }
+
+        if input_path_str.is_empty() || output_path_str.is_empty() {
+            error!("Usage: {} [-s size] <input.raw> <output.png>", args[0]);
             std::process::exit(1);
         }
 
-        let input_path = Path::new(&args[1]);
-        let output_path = Path::new(&args[2]);
+        let input_path = Path::new(&input_path_str);
+        let output_path = Path::new(&output_path_str);
 
-        info!("Generating thumbnail for {:?}...", input_path);
-        match generate_thumbnail(input_path) {
+        info!("Generating thumbnail for {:?} with size {}...", input_path, size);
+        match generate_thumbnail(input_path, size) {
             Ok(thumbnail) => {
                 info!("Saving thumbnail to {:?}...", output_path);
                 thumbnail.save(output_path)?;
@@ -92,7 +106,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn generate_thumbnail(path: &Path) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+fn generate_thumbnail(path: &Path, size: u32) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
     let params = RawDecodeParams { image_index: 0 };
 
     // First, try to extract the embedded preview, which is fastest.
@@ -103,7 +117,7 @@ fn generate_thumbnail(path: &Path) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
         result
     } {
         info!("Successfully extracted preview for {:?}", path);
-        let thumbnail = preview.thumbnail(512, 512);
+        let thumbnail = preview.thumbnail(size, size);
         return Ok(thumbnail.to_rgb8());
     }
 
@@ -129,7 +143,7 @@ fn generate_thumbnail(path: &Path) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
     };
     
     if let Some(preview) = preview_result {
-        let thumbnail = preview.thumbnail(512, 512);
+        let thumbnail = preview.thumbnail(size, size);
         return Ok(thumbnail.to_rgb8());
     }
 
@@ -149,6 +163,6 @@ fn generate_thumbnail(path: &Path) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
         // raw_image is dropped here, closing all file handles
     };
     
-    let thumbnail = image.thumbnail(512, 512);
+    let thumbnail = image.thumbnail(size, size);
     Ok(thumbnail.to_rgb8())
 }

@@ -2,34 +2,48 @@
 
 A simple command-line tool and D-Bus service to generate thumbnails for raw image files.
 
-## Building
+## Installation
 
-To build the project, you need to have Rust and Cargo installed. You can install them from [rust-lang.org](https://www.rust-lang.org/).
+### Dependencies
 
-Once you have Rust and Cargo installed, you can build the project by running the following command in the project directory:
+You need to have Rust and Cargo installed to build this project.
+
+### Building and Installing
+
+The easiest way to install `raw-thumbnailer` is using the provided Makefile. This will install the binary to `/usr/local/bin` and the GNOME thumbnailer configuration to `/usr/local/share/thumbnailers`.
 
 ```bash
-cargo build --release
+sudo make install
 ```
 
-The executable will be located at `target/release/raw-thumbnailer`.
+To uninstall:
+
+```bash
+sudo make uninstall
+```
 
 ## Usage
 
 ### Command-line
 
-To generate a thumbnail from the command-line, you can run the following command:
+To generate a thumbnail from the command-line:
 
 ```bash
-./target/release/raw-thumbnailer <input.raw> <output.png>
+raw-thumbnailer [-s <size>] <input.raw> <output.png>
 ```
+
+- `-s <size>`: Optional. Specify the size of the thumbnail (default is 512). The thumbnail will be scaled to fit within a box of `size x size` while preserving aspect ratio.
 
 ### D-Bus service
 
-The tool can also be run as a D-Bus service. To start the service, run the following command:
+The tool can also be run as a D-Bus service, which is used by some applications to request thumbnails.
 
 ```bash
-./target/release/raw-thumbnailer --dbus
+raw-thumbnailer --dbus
 ```
 
 The service will be available at `org.gnome.RawThumbnailer`.
+
+## Logs
+
+Logs are written to standard error (stderr). When running as a system service or within GNOME, these logs can typically be viewed using `journalctl`.
