@@ -7,43 +7,75 @@ use rawler::imgop::develop::RawDevelop;
 use simplelog::{Config, LevelFilter, SimpleLogger};
 use std::env;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use zbus::{dbus_interface, ConnectionBuilder};
 
-struct Thumbnailer;
+struct Thumbnailer {
+    semaphore: Arc<Semaphore>,
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next()?;
+            let h2 = chars.next()?;
+            let hex = [h1, h2];
+            let hex_str = std::str::from_utf8(&hex).ok()?;
+            let decoded = u8::from_str_radix(hex_str, 16).ok()?;
+            bytes.push(decoded);
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
 
 #[dbus_interface(name = "org.gnome.RawThumbnailer")]
 impl Thumbnailer {
-    fn thumbnail(
+    async fn thumbnail(
         &self,
         uri: &str,
         output_path: &str,
     ) -> std::result::Result<(), zbus::fdo::Error> {
         info!("Thumbnail request for URI: {}", uri);
         let path_str = uri.trim_start_matches("file://");
-        let input_path = Path::new(path_str);
-        let output_path = Path::new(output_path);
+        let decoded_path_str = percent_decode(path_str)
+            .ok_or_else(|| zbus::fdo::Error::Failed("Invalid URI encoding".to_string()))?;
+        let input_path = PathBuf::from(decoded_path_str);
+        let output_path = PathBuf::from(output_path);
 
-        match generate_thumbnail(input_path, 256) {
-            Ok(thumbnail) => {
-                info!("Saving thumbnail to {:?}...", output_path);
-                if let Err(e) = thumbnail.save(output_path) {
-                    error!("Failed to save thumbnail: {}", e);
-                    return Err(zbus::fdo::Error::Failed(e.to_string()));
+        let semaphore = self.semaphore.clone();
+        let permit = semaphore.acquire_owned().await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            match generate_thumbnail(&input_path, 256) {
+                Ok(thumbnail) => {
+                    info!("Saving thumbnail to {:?}...", output_path);
+                    if let Err(e) = thumbnail.save(&output_path) {
+                        error!("Failed to save thumbnail: {}", e);
+                        return Err(zbus::fdo::Error::Failed(e.to_string()));
+                    }
+                    info!("Thumbnail created successfully.");
+                    Ok(())
                 }
-                info!("Thumbnail created successfully.");
-                Ok(())
+                Err(e) => {
+                    error!("Failed to generate thumbnail for {:?}: {}", input_path, e);
+                    Err(zbus::fdo::Error::Failed(e.to_string()))
+                }
             }
-            Err(e) => {
-                error!("Failed to generate thumbnail for {:?}: {}", input_path, e);
-                Err(zbus::fdo::Error::Failed(e.to_string()))
-            }
-        }
+        })
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-
+#[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging to stderr (compatible with bwrap sandboxes and systemd journal)
     let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
@@ -51,15 +83,28 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.contains(&"--dbus".to_string()) {
         info!("Starting D-Bus service...");
+
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        info!("Setting concurrency limit to {}", num_cpus);
+        let semaphore = Arc::new(Semaphore::new(num_cpus));
+
         let _conn = ConnectionBuilder::session()?
             .name("org.gnome.RawThumbnailer")?
-            .serve_at("/org/gnome/RawThumbnailer", Thumbnailer)?
+            .serve_at("/org/gnome/RawThumbnailer", Thumbnailer { semaphore })?
             .build()
             .await?;
 
         // Keep the service running
         std::future::pending::<()>().await;
     } else {
+        if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
+            println!("Usage: {} [-s size] <input.raw> <output.png>", args[0]);
+            println!("       {} --dbus", args[0]);
+            return Ok(());
+        }
+
         // Parse arguments manually to handle -s flag
         // Expected usage: raw-thumbnailer [-s size] <input> <output>
         let mut input_path_str = String::new();
@@ -82,7 +127,9 @@ async fn main() -> Result<()> {
         }
 
         if input_path_str.is_empty() || output_path_str.is_empty() {
-            error!("Usage: {} [-s size] <input.raw> <output.png>", args[0]);
+            let msg = format!("Usage: {} [-s size] <input.raw> <output.png>", args[0]);
+            error!("{}", msg);
+            eprintln!("{}", msg);
             std::process::exit(1);
         }
 
@@ -97,7 +144,9 @@ async fn main() -> Result<()> {
                 info!("Thumbnail created successfully.");
             }
             Err(e) => {
-                error!("Failed to generate thumbnail for {:?}: {}", input_path, e);
+                let msg = format!("Failed to generate thumbnail for {:?}: {}", input_path, e);
+                error!("{}", msg);
+                eprintln!("{}", msg);
                 return Err(e);
             }
         }
