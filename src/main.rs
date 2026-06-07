@@ -1,7 +1,6 @@
 use anyhow::Result;
 use image::{ImageBuffer, Rgb};
 use log::{error, info};
-use rawler::analyze::extract_preview_pixels;
 use rawler::decoders::RawDecodeParams;
 use rawler::imgop::develop::RawDevelop;
 use simplelog::{Config, LevelFilter, SimpleLogger};
@@ -42,14 +41,11 @@ struct Thumbnailer {
 
 impl Thumbnailer {
     fn new() -> Self {
-        let num_cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        info!("Setting concurrency limit to {}", num_cpus);
+        info!("Setting concurrency limit to 4");
         Self {
             cancelled_handles: Arc::new(Mutex::new(HashSet::new())),
             next_handle: AtomicU32::new(1),
-            semaphore: Arc::new(Semaphore::new(num_cpus)),
+            semaphore: Arc::new(Semaphore::new(4)),
         }
     }
 }
@@ -86,177 +82,201 @@ impl Thumbnailer {
                 &handle,
             ).await;
 
-            // Process the URIs sequentially to avoid excessive memory usage.
-            for (uri, _mime_type) in uris.iter().zip(mime_types.iter()) {
-                // Check if cancelled
-                {
-                    let cancelled = cancelled_handles.lock().unwrap();
-                    if cancelled.contains(&handle) {
-                        info!("Queue handle {} was cancelled.", handle);
-                        break;
-                    }
-                }
+            let mut join_set = tokio::task::JoinSet::new();
 
-                info!("Processing queue URI: {}", uri);
-                let parsed_url = match Url::parse(uri) {
-                    Ok(u) => u,
-                    Err(e) => {
-                        error!("Invalid URI format: {}", e);
-                        let _ = connection.emit_signal(
-                            None::<&str>,
-                            "/org/freedesktop/thumbnails/Thumbnailer1",
-                            "org.freedesktop.thumbnails.Thumbnailer1",
-                            "Error",
-                            &(handle, vec![uri.clone()], 1u32, &format!("Invalid URI: {}", e)),
-                        ).await;
-                        continue;
-                    }
-                };
+            for (uri, _mime_type) in uris.into_iter().zip(mime_types.into_iter()) {
+                let connection = connection.clone();
+                let cancelled_handles = cancelled_handles.clone();
+                let semaphore = semaphore.clone();
+                let flavor = flavor.clone();
 
-                let input_path = match parsed_url.to_file_path() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        error!("URI is not a valid file path: {}", uri);
-                        let _ = connection.emit_signal(
-                            None::<&str>,
-                            "/org/freedesktop/thumbnails/Thumbnailer1",
-                            "org.freedesktop.thumbnails.Thumbnailer1",
-                            "Error",
-                            &(handle, vec![uri.clone()], 1u32, "URI is not a valid file path"),
-                        ).await;
-                        continue;
-                    }
-                };
-
-                // Determine cache directory based on flavor
-                let dir_name = match flavor.as_str() {
-                    "normal" => "normal",
-                    "large" => "large",
-                    "xlarge" => "xlarge",
-                    "xxlarge" => "xxlarge",
-                    _ => "large",
-                };
-
-                let size = match flavor.as_str() {
-                    "normal" => 128,
-                    "large" => 256,
-                    "xlarge" => 512,
-                    "xxlarge" => 1024,
-                    _ => 256,
-                };
-
-                let cache_dir = match directories::BaseDirs::new() {
-                    Some(dirs) => dirs.cache_dir().join("thumbnails").join(dir_name),
-                    None => {
-                        error!("Failed to find user cache directory");
-                        let _ = connection.emit_signal(
-                            None::<&str>,
-                            "/org/freedesktop/thumbnails/Thumbnailer1",
-                            "org.freedesktop.thumbnails.Thumbnailer1",
-                            "Error",
-                            &(handle, vec![uri.clone()], 2u32, "Failed to find user cache directory"),
-                        ).await;
-                        continue;
-                    }
-                };
-
-                if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-                    error!("Failed to create cache directory {:?}: {}", cache_dir, e);
-                    let _ = connection.emit_signal(
-                        None::<&str>,
-                        "/org/freedesktop/thumbnails/Thumbnailer1",
-                        "org.freedesktop.thumbnails.Thumbnailer1",
-                        "Error",
-                        &(handle, vec![uri.clone()], 2u32, &format!("Failed to create cache directory: {}", e)),
-                    ).await;
-                    continue;
-                }
-
-                // Output filename: md5(uri).png
-                let hash = md5::compute(uri.as_bytes());
-                let md5_hex = format!("{:x}", hash);
-                let output_path = cache_dir.join(format!("{}.png", md5_hex));
-
-                // Read mtime
-                let mtime_str = match std::fs::metadata(&input_path).and_then(|m| m.modified()) {
-                    Ok(modified) => {
-                        match modified.duration_since(std::time::UNIX_EPOCH) {
-                            Ok(duration) => duration.as_secs().to_string(),
-                            Err(_) => "0".to_string(),
+                join_set.spawn(async move {
+                    // Check if cancelled before starting
+                    {
+                        let cancelled = cancelled_handles.lock().unwrap();
+                        if cancelled.contains(&handle) {
+                            info!("Queue handle {} was cancelled. Skipping {}", handle, uri);
+                            return;
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to read metadata for {:?}: {}", input_path, e);
+
+                    info!("Processing queue URI: {}", uri);
+                    let parsed_url = match Url::parse(&uri) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            error!("Invalid URI format: {}", e);
+                            let _ = connection.emit_signal(
+                                None::<&str>,
+                                "/org/freedesktop/thumbnails/Thumbnailer1",
+                                "org.freedesktop.thumbnails.Thumbnailer1",
+                                "Error",
+                                &(handle, vec![uri.clone()], 1u32, &format!("Invalid URI: {}", e)),
+                            ).await;
+                            return;
+                        }
+                    };
+
+                    let input_path = match parsed_url.to_file_path() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            error!("URI is not a valid file path: {}", uri);
+                            let _ = connection.emit_signal(
+                                None::<&str>,
+                                "/org/freedesktop/thumbnails/Thumbnailer1",
+                                "org.freedesktop.thumbnails.Thumbnailer1",
+                                "Error",
+                                &(handle, vec![uri.clone()], 1u32, "URI is not a valid file path"),
+                            ).await;
+                            return;
+                        }
+                    };
+
+                    // Determine cache directory based on flavor
+                    let dir_name = match flavor.as_str() {
+                        "normal" => "normal",
+                        "large" => "large",
+                        "xlarge" => "xlarge",
+                        "xxlarge" => "xxlarge",
+                        _ => "large",
+                    };
+
+                    let size = match flavor.as_str() {
+                        "normal" => 128,
+                        "large" => 256,
+                        "xlarge" => 512,
+                        "xxlarge" => 1024,
+                        _ => 256,
+                    };
+
+                    let cache_dir = match directories::BaseDirs::new() {
+                        Some(dirs) => dirs.cache_dir().join("thumbnails").join(dir_name),
+                        None => {
+                            error!("Failed to find user cache directory");
+                            let _ = connection.emit_signal(
+                                None::<&str>,
+                                "/org/freedesktop/thumbnails/Thumbnailer1",
+                                "org.freedesktop.thumbnails.Thumbnailer1",
+                                "Error",
+                                &(handle, vec![uri.clone()], 2u32, "Failed to find user cache directory"),
+                            ).await;
+                            return;
+                        }
+                    };
+
+                    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                        error!("Failed to create cache directory {:?}: {}", cache_dir, e);
                         let _ = connection.emit_signal(
                             None::<&str>,
                             "/org/freedesktop/thumbnails/Thumbnailer1",
                             "org.freedesktop.thumbnails.Thumbnailer1",
                             "Error",
-                            &(handle, vec![uri.clone()], 3u32, &format!("Failed to read file metadata: {}", e)),
+                            &(handle, vec![uri.clone()], 2u32, &format!("Failed to create cache directory: {}", e)),
                         ).await;
-                        continue;
+                        return;
                     }
-                };
 
-                // Concurrency limiting: Acquire permit from semaphore before generating thumbnail.
-                let permit = match semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!("Failed to acquire concurrency permit: {}", e);
-                        let _ = connection.emit_signal(
-                            None::<&str>,
-                            "/org/freedesktop/thumbnails/Thumbnailer1",
-                            "org.freedesktop.thumbnails.Thumbnailer1",
-                            "Error",
-                            &(handle, vec![uri.clone()], 5u32, &format!("Failed to acquire concurrency permit: {}", e)),
-                        ).await;
-                        continue;
-                    }
-                };
+                    // Output filename: md5(uri).png
+                    let hash = md5::compute(uri.as_bytes());
+                    let md5_hex = format!("{:x}", hash);
+                    let output_path = cache_dir.join(format!("{}.png", md5_hex));
 
-                let input_path_clone = input_path.clone();
-                let output_path_clone = output_path.clone();
-                let uri_clone = uri.clone();
-                let mtime_str_clone = mtime_str.clone();
+                    // Read mtime
+                    let mtime_str = match std::fs::metadata(&input_path).and_then(|m| m.modified()) {
+                        Ok(modified) => {
+                            match modified.duration_since(std::time::UNIX_EPOCH) {
+                                Ok(duration) => duration.as_secs().to_string(),
+                                Err(_) => "0".to_string(),
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to read metadata for {:?}: {}", input_path, e);
+                            let _ = connection.emit_signal(
+                                None::<&str>,
+                                "/org/freedesktop/thumbnails/Thumbnailer1",
+                                "org.freedesktop.thumbnails.Thumbnailer1",
+                                "Error",
+                                &(handle, vec![uri.clone()], 3u32, &format!("Failed to read file metadata: {}", e)),
+                            ).await;
+                            return;
+                        }
+                    };
 
-                let generate_result = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    generate_thumbnail(&input_path_clone, size).and_then(|thumbnail| {
-                        save_png_with_metadata(&output_path_clone, &thumbnail, &uri_clone, &mtime_str_clone)
-                    })
-                }).await;
+                    // Check if cancelled again before acquiring permit/generating
+                    {
+                        let cancelled = cancelled_handles.lock().unwrap();
+                        if cancelled.contains(&handle) {
+                            info!("Queue handle {} was cancelled. Skipping {}", handle, uri);
+                            return;
+                        }
+                    }
 
-                match generate_result {
-                    Ok(Ok(())) => {
-                        info!("Thumbnail successfully generated & saved to {:?}", output_path);
-                        let _ = connection.emit_signal(
-                            None::<&str>,
-                            "/org/freedesktop/thumbnails/Thumbnailer1",
-                            "org.freedesktop.thumbnails.Thumbnailer1",
-                            "Ready",
-                            &(handle, vec![uri.clone()]),
-                        ).await;
+                    // Concurrency limiting: Acquire permit from semaphore before generating thumbnail.
+                    let permit = match semaphore.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("Failed to acquire concurrency permit: {}", e);
+                            let _ = connection.emit_signal(
+                                None::<&str>,
+                                "/org/freedesktop/thumbnails/Thumbnailer1",
+                                "org.freedesktop.thumbnails.Thumbnailer1",
+                                "Error",
+                                &(handle, vec![uri.clone()], 5u32, &format!("Failed to acquire concurrency permit: {}", e)),
+                            ).await;
+                            return;
+                        }
+                    };
+
+                    let input_path_clone = input_path.clone();
+                    let output_path_clone = output_path.clone();
+                    let uri_clone = uri.clone();
+                    let mtime_str_clone = mtime_str.clone();
+
+                    let generate_result = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        generate_thumbnail(&input_path_clone, size).and_then(|thumbnail| {
+                            save_png_with_metadata(&output_path_clone, &thumbnail, &uri_clone, &mtime_str_clone)
+                        })
+                    }).await;
+
+                    match generate_result {
+                        Ok(Ok(())) => {
+                            info!("Thumbnail successfully generated & saved to {:?}", output_path);
+                            let _ = connection.emit_signal(
+                                None::<&str>,
+                                "/org/freedesktop/thumbnails/Thumbnailer1",
+                                "org.freedesktop.thumbnails.Thumbnailer1",
+                                "Ready",
+                                &(handle, vec![uri.clone()]),
+                            ).await;
+                        }
+                        Ok(Err(e)) => {
+                            error!("Failed to generate thumbnail for {:?}: {}", input_path, e);
+                            let _ = connection.emit_signal(
+                                None::<&str>,
+                                "/org/freedesktop/thumbnails/Thumbnailer1",
+                                "org.freedesktop.thumbnails.Thumbnailer1",
+                                "Error",
+                                &(handle, vec![uri.clone()], 5u32, &format!("Failed to generate thumbnail: {}", e)),
+                            ).await;
+                        }
+                        Err(e) => {
+                            error!("Blocking task panicked: {}", e);
+                            let _ = connection.emit_signal(
+                                None::<&str>,
+                                "/org/freedesktop/thumbnails/Thumbnailer1",
+                                "org.freedesktop.thumbnails.Thumbnailer1",
+                                "Error",
+                                &(handle, vec![uri.clone()], 5u32, "Internal thumbnailer panic"),
+                            ).await;
+                        }
                     }
-                    Ok(Err(e)) => {
-                        error!("Failed to generate thumbnail for {:?}: {}", input_path, e);
-                        let _ = connection.emit_signal(
-                            None::<&str>,
-                            "/org/freedesktop/thumbnails/Thumbnailer1",
-                            "org.freedesktop.thumbnails.Thumbnailer1",
-                            "Error",
-                            &(handle, vec![uri.clone()], 5u32, &format!("Failed to generate thumbnail: {}", e)),
-                        ).await;
-                    }
-                    Err(e) => {
-                        error!("Blocking task panicked: {}", e);
-                        let _ = connection.emit_signal(
-                            None::<&str>,
-                            "/org/freedesktop/thumbnails/Thumbnailer1",
-                            "org.freedesktop.thumbnails.Thumbnailer1",
-                            "Error",
-                            &(handle, vec![uri.clone()], 5u32, "Internal thumbnailer panic"),
-                        ).await;
-                    }
+                });
+            }
+
+            // Await all spawned tasks in the join set
+            while let Some(res) = join_set.join_next().await {
+                if let Err(e) = res {
+                    error!("Join error in queue worker: {}", e);
                 }
             }
 
@@ -402,80 +422,46 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn get_raw_orientation(path: &Path) -> u8 {
-    let params = RawDecodeParams { image_index: 0 };
-    if let Ok(raw_source) = rawler::rawsource::RawSource::new(path) {
-        if let Ok(decoder) = rawler::get_decoder(&raw_source) {
-            if let Ok(meta) = decoder.raw_metadata(&raw_source, &params) {
-                return meta.exif.orientation.unwrap_or(1) as u8;
-            }
-        }
-    }
-    1
-}
-
 fn generate_thumbnail(path: &Path, size: u32) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
     let params = RawDecodeParams { image_index: 0 };
-    let orient = image::metadata::Orientation::from_exif(get_raw_orientation(path))
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    
+    // Open the raw source file exactly once.
+    let raw_source = rawler::rawsource::RawSource::new(path)?;
+    let decoder = rawler::get_decoder(&raw_source)?;
+    
+    // Extract metadata & orientation once from the decoder.
+    let orient = if let Ok(meta) = decoder.raw_metadata(&raw_source, &params) {
+        image::metadata::Orientation::from_exif(meta.exif.orientation.unwrap_or(1) as u8)
+            .unwrap_or(image::metadata::Orientation::NoTransforms)
+    } else {
+        image::metadata::Orientation::NoTransforms
+    };
 
-    // First, try to extract the embedded preview, which is fastest.
-    // Wrap in a scope to ensure RawSource is dropped before returning.
-    if let Ok(preview) = {
-        let result = extract_preview_pixels(path, &params);
-        // Extract preview_pixels internally creates and drops RawSource
-        result
-    } {
+    // 1. Try to decode the preview image from the same decoder.
+    if let Ok(Some(preview)) = decoder.preview_image(&raw_source, &params) {
         info!("Successfully extracted preview for {:?}", path);
         let mut thumbnail = preview.thumbnail(size, size);
         thumbnail.apply_orientation(orient);
         return Ok(thumbnail.to_rgb8());
     }
 
-    info!(
-        "No preview found or preview extraction failed, trying to decode preview image from {:?}",
-        path
-    );
-
-    // Try to decode preview image, ensuring RawSource is dropped before returning
-    let preview_result = {
-        let raw_source = rawler::rawsource::RawSource::new(path)?;
-        if let Ok(decoder) = rawler::get_decoder(&raw_source) {
-            if let Ok(Some(preview)) = decoder.preview_image(&raw_source, &params) {
-                info!("Successfully decoded preview image for {:?}", path);
-                Some(preview)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-        // raw_source is dropped here, closing all file handles
-    };
-    
-    if let Some(preview) = preview_result {
+    // 2. Try to decode the full image from the same decoder.
+    if let Ok(Some(preview)) = decoder.full_image(&raw_source, &params) {
+        info!("Successfully decoded full preview image for {:?}", path);
         let mut thumbnail = preview.thumbnail(size, size);
         thumbnail.apply_orientation(orient);
         return Ok(thumbnail.to_rgb8());
     }
 
-    // If preview extraction fails, fall back to decoding the full raw image.
-    info!(
-        "No preview found or preview extraction failed, decoding full image for {:?}",
-        path
-    );
-    
-    // Wrap full decode in a scope to ensure resources are dropped
-    let image = {
-        let raw_image = rawler::decode_file(path)?;
-        let developed_image = RawDevelop::default().develop_intermediate(&raw_image)?;
-        developed_image
-            .to_dynamic_image()
-            .ok_or_else(|| anyhow::anyhow!("Failed to convert to dynamic image"))?
-        // raw_image is dropped here, closing all file handles
-    };
-    
-    let mut thumbnail = image.thumbnail(size, size);
+    // 3. Fallback: decode full raw image and develop it
+    info!("No preview found, decoding full image for {:?}", path);
+    let raw_image = decoder.raw_image(&raw_source, &params, false)?;
+    let developed_image = RawDevelop::default().develop_intermediate(&raw_image)?;
+    let dynamic_image = developed_image
+        .to_dynamic_image()
+        .ok_or_else(|| anyhow::anyhow!("Failed to convert to dynamic image"))?;
+        
+    let mut thumbnail = dynamic_image.thumbnail(size, size);
     thumbnail.apply_orientation(orient);
     Ok(thumbnail.to_rgb8())
 }
