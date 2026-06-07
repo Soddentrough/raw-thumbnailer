@@ -16,6 +16,22 @@ The easiest way to install `raw-thumbnailer` is using the provided Makefile. Thi
 sudo make install
 ```
 
+### Upgrading
+
+To upgrade from a previous version, it is recommended to uninstall first to ensure a clean state:
+
+```bash
+sudo make uninstall
+sudo make install
+```
+
+After installing or upgrading, you may need to clear the thumbnail cache and restart Nautilus for changes to take effect:
+
+```bash
+rm -rf ~/.cache/thumbnails/*
+nautilus -q
+```
+
 To uninstall:
 
 ```bash
